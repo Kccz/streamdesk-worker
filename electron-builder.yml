@@ -1,0 +1,58 @@
+appId: cc.streamdesk.worker
+productName: StreamDesk Worker
+copyright: Copyright © 2026 StreamDesk
+
+directories:
+  buildResources: resources
+  output: release/${version}
+
+files:
+  - out/**
+  - resources/**
+  - package.json
+  - '!**/.vscode/*'
+  - '!**/{README.md,LICENSE.md}'
+  - '!**/{.git,.gitignore,.eslintrc.cjs}'
+  - '!**/node_modules/*/{README.md,*.md}'
+  - '!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}'
+
+asarUnpack:
+  - resources/**
+  - 'node_modules/playwright/**'
+  - 'node_modules/playwright-core/**'
+
+mac:
+  target:
+    - dmg
+    - zip
+  category: public.app-category.utilities
+  # 不签名构建（等买证书后再开启 hardenedRuntime + entitlements）
+  identity: null
+  hardenedRuntime: false
+  gatekeeperAssess: false
+
+win:
+  target:
+    - nsis
+  artifactName: ${productName}-${version}-setup.${ext}
+  # 不签名构建：用户首次启动会被 SmartScreen 警告
+  signAndEditExecutable: false
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  shortcutName: StreamDesk Worker
+
+linux:
+  target:
+    - AppImage
+  category: Utility
+
+# 暂未配置发布渠道：构建产物在本地 release/ 目录
+# 等准备好 GitHub repo 再取消注释
+# publish:
+#   provider: github
+#   owner: your-org
+#   repo: streamdesk-worker
+#   releaseType: release
