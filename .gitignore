@@ -3,6 +3,7 @@ node_modules
 out
 dist
 release
+*.tsbuildinfo
 
 # 系统/编辑器
 .DS_Store
