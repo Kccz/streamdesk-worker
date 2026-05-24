@@ -49,10 +49,11 @@ linux:
     - AppImage
   category: Utility
 
-# 暂未配置发布渠道：构建产物在本地 release/ 目录
-# 等准备好 GitHub repo 再取消注释
-# publish:
-#   provider: github
-#   owner: your-org
-#   repo: streamdesk-worker
-#   releaseType: release
+# 发布到 GitHub Releases（用于 electron-updater 自动更新）
+# 不签名时仍可用，但 macOS 自动更新会因签名校验失败而拒绝
+# 等买了 Apple Developer 证书后再启用自动更新
+publish:
+  provider: github
+  owner: Kccz
+  repo: streamdesk-worker
+  releaseType: release
