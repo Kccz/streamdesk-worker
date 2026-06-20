@@ -1,6 +1,6 @@
 {
   "name": "streamdesk-worker-app",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "StreamDesk Worker 桌面客户端（Mac / Windows）",
   "main": "out/main/index.js",
   "private": true,
