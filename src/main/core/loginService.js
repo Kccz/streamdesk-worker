@@ -26,6 +26,8 @@ const FATAL_LOGGING_VIEWS = {
   planSelectionContext: '此账号无会员，请检查！',
 };
 
+const OTP_API_ENDPOINT = process.env.OTP_API_ENDPOINT || 'https://yzm.4knaifei.cn/index/index/getCdkData';
+
 class LoginService {
   constructor(options = {}) {
     this.proxy = options.proxy || null;
@@ -52,6 +54,7 @@ class LoginService {
   async login(email, password, options = {}) {
     if (typeof options === 'function') options = {};
     const { dataPath } = options;
+    const otpOptions = buildOtpOptions();
     const t0 = Date.now();
     const elapsed = () => `${Date.now() - t0}ms`;
 
@@ -210,10 +213,30 @@ class LoginService {
         const isOtpPage = emailScreenView === 'collectOtp' || emailScreenView.includes('otp');
         logger.info('NetflixLogin', `[12] 分支 ${isOtpPage ? 'C (OTP 页 → 跳密码页)' : 'B (密码页)'}: 开始浏览器内 GraphQL 流程...`);
 
+        if (otpOptions.enabled) {
+          await page.exposeFunction('__streamDeskWorkerGetOtpCode', async (payload = {}) => {
+            return pollThirdPartyOtpCode({ email, password }, otpOptions, payload);
+          });
+        }
+
         const evalResult = await page.evaluate(
-          async ({ email, password, emailRespData, isOtpPage, GRAPHQL_URL, PERSISTED_QUERY_CLCS, RECAPTCHA_SITE_KEY, TARGET_LOCALE }) => {
+          async ({
+            email,
+            password,
+            otpCode,
+            otpApiEnabled,
+            otpApiInitialDelayMs,
+            otpApiWrongCodeRetryCycles,
+            emailRespData,
+            isOtpPage,
+            GRAPHQL_URL,
+            PERSISTED_QUERY_CLCS,
+            RECAPTCHA_SITE_KEY,
+            TARGET_LOCALE,
+          }) => {
             const browserLogs = [];
             const log = (msg) => browserLogs.push(msg);
+            const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
             // 调试：确认 password 完整传入 evaluate（不打印明文，只看长度+首尾字符）
             log(`[browser] 收到 password mask=${password ? password[0] + '***' + password[password.length - 1] : 'EMPTY'} (len=${password?.length || 0})`);
@@ -290,6 +313,98 @@ class LoginService {
                 if (Array.isArray(arr)) { for (const n of arr) { const su = extractSU(n); if (su) return su; } }
               }
               return null;
+            }
+
+            function findByLabel(nodes, label) {
+              if (!Array.isArray(nodes)) return null;
+              for (const node of nodes) {
+                if (!node || typeof node !== 'object') continue;
+                const text = node.label?.value
+                  || node.webTextWithTags?.text?.value
+                  || node.plainContent?.value
+                  || node.text?.value
+                  || '';
+                if (text === label) return node;
+                for (const value of Object.values(node)) {
+                  if (Array.isArray(value)) {
+                    const found = findByLabel(value, label);
+                    if (found) return found;
+                  } else if (value && typeof value === 'object') {
+                    const found = findByLabel([value], label);
+                    if (found) return found;
+                  }
+                }
+              }
+              return null;
+            }
+
+            function findInputRequirement(node, inputKind) {
+              if (!node || typeof node !== 'object') return null;
+              if (Array.isArray(node)) {
+                for (const child of node) {
+                  const found = findInputRequirement(child, inputKind);
+                  if (found) return found;
+                }
+                return null;
+              }
+
+              const requirements = node.inputFieldRequirements;
+              if (Array.isArray(requirements)) {
+                return requirements.find((item) => item?.field?.loggingInputKind === inputKind)
+                  || requirements[0]
+                  || null;
+              }
+
+              for (const child of Object.values(node)) {
+                const found = findInputRequirement(child, inputKind);
+                if (found) return found;
+              }
+              return null;
+            }
+
+            function findNodeByKey(nodes, key) {
+              if (!Array.isArray(nodes) || !key) return null;
+              for (const node of nodes) {
+                if (!node || typeof node !== 'object') continue;
+                if (node.key === key) return node;
+                for (const value of Object.values(node)) {
+                  if (Array.isArray(value)) {
+                    const found = findNodeByKey(value, key);
+                    if (found) return found;
+                  } else if (value && typeof value === 'object') {
+                    const found = findNodeByKey([value], key);
+                    if (found) return found;
+                  }
+                }
+              }
+              return null;
+            }
+
+            function textFromNode(node) {
+              return node?.webTextWithTags?.text?.value
+                || node?.plainContent?.value
+                || node?.richContent?.value
+                || node?.label?.value
+                || node?.text?.value
+                || '';
+            }
+
+            function alertTextFromResult(result) {
+              const nodes = result?.screen?.componentTree?.nodes || [];
+              const node = findNode(nodes, 'alert-message-body');
+              const directText = textFromNode(node);
+              if (directText) return directText;
+
+              const collectAlert = findNode(nodes, 'collect-input-alert-WARNING')
+                || findNode(nodes, 'collect-input-alert-ERROR')
+                || findNode(nodes, 'collect-input-alert');
+              const contentKey = collectAlert?.content?.key;
+              const contentText = textFromNode(contentKey ? findNodeByKey(nodes, contentKey) : collectAlert?.content);
+              return contentText || textFromNode(collectAlert);
+            }
+
+            function isWrongOtpAlert(text) {
+              return /wasn't quite right|incorrect code|code.*incorrect|验证码.*(错误|不正确)|驗證碼.*(錯誤|不正確)|代碼.*(錯誤|不正確)/i.test(String(text || ''));
             }
 
             try {
@@ -386,13 +501,152 @@ class LoginService {
                 return { error: errText, browserLogs };
               }
 
+              const loginScreenView = loginResult?.screen?.loggingViewName || '';
+              if (loginScreenView === 'mfaSelectFactor') {
+                log('[browser] 检测到 MFA 选择页，查找 account-mfa-button-OTP_EMAIL...');
+                const otpEmailNode = findNode(loginNodes, 'account-mfa-button-OTP_EMAIL');
+                if (otpEmailNode) {
+                  const otpEmailSU = extractSU(otpEmailNode?.onPress);
+                  if (!otpEmailSU) return { error: '找到 OTP_EMAIL 但未找到 serverScreenUpdate', browserLogs };
+
+                  log('[browser] 自动选择 Email a code...');
+                  const otpSelectResp = await gql({
+                    serverState: loginResult?.screen?.serverState || serverState,
+                    serverScreenUpdate: otpEmailSU,
+                    inputFields: [],
+                  });
+
+                  if (otpSelectResp?.errors?.length) return { error: otpSelectResp.errors[0].message, browserLogs };
+                  const otpSelectResult = otpSelectResp?.data?.result;
+                  log(`[browser] OTP_EMAIL 响应: outcome=${otpSelectResult?.outcomeType}, screen=${otpSelectResult?.screen?.loggingViewName || 'none'}`);
+
+                  const otpSelectErrText = alertTextFromResult(otpSelectResult);
+                  if (otpSelectErrText) return { error: otpSelectErrText, browserLogs };
+
+                  const otpScreenView = otpSelectResult?.screen?.loggingViewName || '';
+                  if (otpScreenView === 'CollectOtpInput' || otpScreenView === 'collectOtpInput') {
+                    if (otpApiEnabled) {
+                      log(`[browser] 检测到验证码输入页，等待 ${otpApiInitialDelayMs}ms 后查询第三方验证码`);
+                      await delay(otpApiInitialDelayMs);
+
+                      if (typeof window.__streamDeskWorkerGetOtpCode !== 'function') {
+                        return { error: '验证码 API bridge 未安装', browserLogs };
+                      }
+                    }
+
+                    const maxSubmitAttempts = otpApiEnabled ? 1 + otpApiWrongCodeRetryCycles : 1;
+                    const triedCodes = [];
+                    let currentOtpResult = otpSelectResult;
+                    let lastOtpError = null;
+
+                    for (let submitAttempt = 1; submitAttempt <= maxSubmitAttempts; submitAttempt += 1) {
+                      const currentOtpNodes = currentOtpResult?.screen?.componentTree?.nodes || [];
+                      const submitNode = findByLabel(currentOtpNodes, 'Submit')
+                        || findNode(currentOtpNodes, 'collect-input-submit-cta')
+                        || findNode(currentOtpNodes, 'collect-otp-submit');
+                      const submitSU = extractSU(submitNode?.onPress);
+                      if (!submitSU) return { error: '验证码页未找到 Submit serverScreenUpdate', browserLogs };
+
+                      const requirement = findInputRequirement(submitNode?.onPress, 'smsCode')
+                        || findInputRequirement(submitNode, 'smsCode');
+                      const otpFieldName = requirement?.name
+                        || requirement?.inputFieldName
+                        || requirement?.fieldName
+                        || requirement?.field?.id
+                        || requirement?.field?.loggingInputKind
+                        || 'challengeOtp';
+
+                      let code = '';
+                      if (otpApiEnabled) {
+                        const otpApiResult = await window.__streamDeskWorkerGetOtpCode({
+                          excludeCodes: triedCodes,
+                        });
+                        code = String(otpApiResult?.code || '').trim();
+                        if (!otpApiResult?.success || !/^\d{6}$/.test(code)) {
+                          return { error: otpApiResult?.error || '验证码接口未返回 6 位数字', browserLogs };
+                        }
+                        log(`[browser] 第三方验证码查询成功 attempt=${otpApiResult.attempt || 'unknown'}, submitAttempt=${submitAttempt}/${maxSubmitAttempts}`);
+                      } else {
+                        code = String(otpCode || '').trim();
+                        if (!/^\d{6}$/.test(code)) {
+                          return { error: `OTP_CODE 必须是 6 位数字，当前长度=${code.length}`, browserLogs };
+                        }
+                        log('[browser] 检测到验证码输入页，使用本地 OTP_CODE');
+                      }
+
+                      triedCodes.push(code);
+                      log(`[browser] 提交验证码字段 ${otpFieldName}=****** (${submitAttempt}/${maxSubmitAttempts})`);
+                      const otpSubmitResp = await gql({
+                        serverState: currentOtpResult?.screen?.serverState || loginResult?.screen?.serverState || serverState,
+                        serverScreenUpdate: submitSU,
+                        inputFields: [
+                          { name: otpFieldName, value: { stringValue: code } },
+                        ],
+                      });
+
+                      if (otpSubmitResp?.errors?.length) return { error: otpSubmitResp.errors[0].message, browserLogs };
+                      const otpSubmitResult = otpSubmitResp?.data?.result;
+                      log(`[browser] 验证码提交响应: outcome=${otpSubmitResult?.outcomeType}, screen=${otpSubmitResult?.screen?.loggingViewName || 'none'}, status=${otpSubmitResult?.status || 'none'}`);
+
+                      const otpSubmitErrText = alertTextFromResult(otpSubmitResult);
+                      if (otpSubmitErrText) {
+                        lastOtpError = otpSubmitErrText;
+                        log(`[browser] 验证码提交返回提示: ${otpSubmitErrText}`);
+                        if (otpApiEnabled && isWrongOtpAlert(otpSubmitErrText) && submitAttempt < maxSubmitAttempts) {
+                          currentOtpResult = otpSubmitResult;
+                          log('[browser] 验证码错误，继续轮询第三方接口后重试');
+                          continue;
+                        }
+                        return { error: otpSubmitErrText, browserLogs };
+                      }
+
+                      return {
+                        success: true,
+                        browserLogs,
+                        mfaSelected: 'OTP_EMAIL',
+                        otpSubmitted: true,
+                        otpSubmitAttempts: submitAttempt,
+                        otpOutcome: otpSubmitResult?.outcomeType || null,
+                        otpScreen: otpSubmitResult?.screen?.loggingViewName || null,
+                      };
+                    }
+
+                    return { error: lastOtpError || '验证码重试次数已用完', browserLogs };
+                  }
+
+                  log('[browser] 已选择邮箱验证码，等待后续验证码步骤或 Cookie');
+                  return {
+                    success: true,
+                    browserLogs,
+                    mfaSelected: 'OTP_EMAIL',
+                    mfaOutcome: otpSelectResult?.outcomeType || null,
+                    mfaScreen: otpSelectResult?.screen?.loggingViewName || null,
+                  };
+                }
+
+                log('[browser] 未找到 account-mfa-button-OTP_EMAIL，保持原流程等待 Cookie');
+              }
+
               log('[browser] 密码提交成功，等待 Cookie');
               return { success: true, browserLogs };
             } catch (err) {
               return { error: err.message, browserLogs };
             }
           },
-          { email, password, emailRespData, isOtpPage, GRAPHQL_URL, PERSISTED_QUERY_CLCS, RECAPTCHA_SITE_KEY, TARGET_LOCALE },
+          {
+            email,
+            password,
+            otpCode: otpOptions.fallbackCode,
+            otpApiEnabled: otpOptions.enabled,
+            otpApiInitialDelayMs: otpOptions.initialDelayMs,
+            otpApiWrongCodeRetryCycles: otpOptions.wrongCodeRetryCycles,
+            emailRespData,
+            isOtpPage,
+            GRAPHQL_URL,
+            PERSISTED_QUERY_CLCS,
+            RECAPTCHA_SITE_KEY,
+            TARGET_LOCALE,
+          },
         ).catch((e) => {
           // 页面跳转导致 context 销毁 = 登录成功
           if (e.message.includes('Execution context was destroyed') || e.message.includes('navigation')) {
@@ -440,24 +694,9 @@ class LoginService {
       if (this._aborted) {
         return { success: false, cookies: null, error: '用户取消', cancelled: true };
       }
-      // 将 Playwright 内部错误翻译为用户友好的提示
-      const msg = err.message || '';
-      let userError;
-      if (/Target.*closed|browser has been closed/i.test(msg)) {
-        userError = '浏览器被意外关闭（可能是内存不足或手动关闭了窗口）';
-      } else if (/Timeout/i.test(msg)) {
-        userError = '操作超时（页面加载过慢或网络不通）';
-      } else if (/net::ERR_PROXY/i.test(msg)) {
-        userError = '代理连接失败，请检查代理配置';
-      } else if (/net::ERR_/i.test(msg)) {
-        userError = `网络错误：${msg.match(/net::\w+/)?.[0] || msg}`;
-      } else if (/Execution context was destroyed|navigation/i.test(msg)) {
-        userError = '页面跳转导致操作中断';
-      } else {
-        userError = msg;
-      }
+      const msg = err?.message || String(err);
       logger.error('NetflixLogin', `异常: ${msg}`);
-      return { success: false, cookies: null, error: userError };
+      return { success: false, cookies: null, error: msg };
     } finally {
       // 释放 context 回 pool（不关闭主进程）
       if (poolHandle) {
@@ -480,6 +719,167 @@ class LoginService {
     }
     return null;
   }
+}
+
+function buildOtpOptions() {
+  return {
+    enabled: process.env.OTP_API !== '0',
+    initialDelayMs: parsePositiveInt(process.env.OTP_API_DELAY_MS, 20000),
+    maxAttempts: parsePositiveInt(process.env.OTP_API_ATTEMPTS, 20),
+    retryDelayMs: parsePositiveInt(process.env.OTP_API_INTERVAL_MS, 1000),
+    wrongCodeRetryCycles: parseNonNegativeInt(process.env.OTP_API_WRONG_RETRIES, 1),
+    fallbackCode: process.env.OTP_CODE || process.env.LOGIN_OTP_CODE || '',
+  };
+}
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value || '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeInt(value, fallback) {
+  if (value === '0') return 0;
+  const parsed = Number.parseInt(value || '', 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+async function pollThirdPartyOtpCode(credentials, otpOptions, options = {}) {
+  const maxAttempts = otpOptions.maxAttempts;
+  const excludeCodes = new Set((options.excludeCodes || []).map((code) => String(code).trim()).filter(Boolean));
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await queryThirdPartyVerificationCode(credentials.email, credentials.password);
+      if (result?.success === false) {
+        logger.info('NetflixLogin', `[otp-api] 第 ${attempt}/${maxAttempts} 次 API 返回失败: ${result.message || 'unknown'}`);
+        if (attempt < maxAttempts) await sleep(otpOptions.retryDelayMs);
+        continue;
+      }
+
+      const extracted = extractVerificationCode(result);
+
+      if (/^\d{6}$/.test(extracted.code || '')) {
+        if (excludeCodes.has(extracted.code)) {
+          logger.info('NetflixLogin', `[otp-api] 第 ${attempt}/${maxAttempts} 次仍是已提交过的验证码，继续等待新码`);
+          if (attempt < maxAttempts) await sleep(otpOptions.retryDelayMs);
+          continue;
+        }
+        logger.info('NetflixLogin', `[otp-api] 第 ${attempt}/${maxAttempts} 次获取到 6 位验证码`);
+        return { success: true, code: extracted.code, attempt };
+      }
+
+      if (extracted.candidate) {
+        logger.info('NetflixLogin', `[otp-api] 第 ${attempt}/${maxAttempts} 次返回候选值但不是 6 位: ${describeCodeCandidate(extracted.candidate)}`);
+      } else {
+        logger.info('NetflixLogin', `[otp-api] 第 ${attempt}/${maxAttempts} 次未提取到验证码字段`);
+      }
+    } catch (err) {
+      logger.info('NetflixLogin', `[otp-api] 第 ${attempt}/${maxAttempts} 次查询异常: ${err.message}`);
+    }
+
+    if (attempt < maxAttempts) await sleep(otpOptions.retryDelayMs);
+  }
+
+  return {
+    success: false,
+    error: `验证码接口连续 ${maxAttempts} 次未返回可用的新 6 位数字`,
+  };
+}
+
+async function queryThirdPartyVerificationCode(email, password) {
+  const cdk = `${email}----${password}`;
+  const response = await fetch(OTP_API_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json;charset=UTF-8',
+      Accept: 'application/json, text/plain, */*',
+      'User-Agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    },
+    body: JSON.stringify({ cdk }),
+  });
+
+  if (!response.ok) {
+    return {
+      success: false,
+      message: `API 请求失败: ${response.status} ${response.statusText}`,
+    };
+  }
+
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  const explicitSuccess = data.code === 0 || data.success === true || data.type === 'success';
+  const explicitFailure = data.success === false
+    || (data.code !== undefined && data.code !== 0)
+    || ['error', 'fail', 'failed'].includes(String(data.type || '').toLowerCase());
+
+  if (explicitSuccess || !explicitFailure) {
+    return {
+      success: true,
+      message: 'API 查询成功',
+      apiData: data.data || data,
+    };
+  }
+
+  return {
+    success: false,
+    message: data.msg || data.message || 'API 查询失败',
+  };
+}
+
+function extractVerificationCode(result) {
+  const apiData = result?.apiData || result || null;
+  const candidates = [];
+  const add = (value) => {
+    if (value !== null && value !== undefined && value !== '') candidates.push(value);
+  };
+
+  add(apiData?.result?.code);
+  add(apiData?.data?.result?.code);
+  add(apiData?.data?.code);
+  add(apiData?.captcha);
+  add(apiData?.verificationCode);
+  collectFieldValues(apiData, ['code', 'captcha', 'verificationCode'], candidates);
+
+  let firstCandidate = null;
+  for (const candidate of candidates) {
+    const text = String(candidate).trim();
+    if (!text || text === '0') continue;
+    if (!firstCandidate) firstCandidate = text;
+    if (/^\d{6}$/.test(text)) return { code: text, candidate: text };
+  }
+
+  return { code: null, candidate: firstCandidate };
+}
+
+function collectFieldValues(payload, fieldNames, output, seen = new Set()) {
+  if (!payload || typeof payload !== 'object') return;
+  if (seen.has(payload)) return;
+  seen.add(payload);
+
+  const names = new Set(fieldNames.map((name) => String(name).toLowerCase()));
+  if (Array.isArray(payload)) {
+    for (const item of payload) collectFieldValues(item, fieldNames, output, seen);
+    return;
+  }
+
+  for (const [key, value] of Object.entries(payload)) {
+    if (names.has(String(key).toLowerCase()) && value !== null && value !== undefined && value !== '') {
+      output.push(value);
+    }
+    if (value && typeof value === 'object') collectFieldValues(value, fieldNames, output, seen);
+  }
+}
+
+function describeCodeCandidate(value) {
+  const text = String(value || '').trim();
+  if (!text) return 'empty';
+  if (/^https?:\/\//i.test(text)) return `url(len=${text.length})`;
+  return `len=${text.length}, digitsOnly=${/^\d+$/.test(text)}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 module.exports = LoginService;
