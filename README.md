@@ -12,7 +12,10 @@ pnpm dev
 ## 打包
 
 ```bash
-pnpm build:mac     # macOS dmg + zip
+pnpm build:mac:dir     # macOS 本地快速验证：只生成 .app，不打 dmg/zip
+pnpm build:mac:update  # macOS 自动更新发布：只生成 arm64/x64 zip
+pnpm build:mac:full    # macOS 完整发布：生成 arm64/x64 dmg + zip
+pnpm build:mac         # 同 build:mac:full
 pnpm build:win     # Windows nsis 安装包
 pnpm build:linux   # Linux AppImage
 ```

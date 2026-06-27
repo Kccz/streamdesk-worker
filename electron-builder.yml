@@ -12,6 +12,13 @@ files:
   - out/**
   - resources/**
   - package.json
+  - '!**/*.map'
+  - '!**/*.d.ts'
+  - '!**/*.ts'
+  - '!**/*.tsx'
+  - '!resources/admin-logo.webp'
+  - '!resources/icon.icns'
+  - '!resources/icon.iconset/**'
   - '!**/.vscode/*'
   - '!**/{README.md,LICENSE.md}'
   - '!**/{.git,.gitignore,.eslintrc.cjs}'
@@ -27,6 +34,7 @@ mac:
   target:
     - dmg
     - zip
+  icon: resources/icon.icns
   artifactName: StreamDesk-Worker-${version}-${arch}.${ext}
   category: public.app-category.utilities
   # 不签名构建（等买证书后再开启 hardenedRuntime + entitlements）

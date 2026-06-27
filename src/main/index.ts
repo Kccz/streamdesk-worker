@@ -24,6 +24,7 @@ function createWindow(): void {
     title: 'StreamDesk Worker',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     backgroundColor: '#0f1014',
+    icon: join(__dirname, '../../resources/icon.png'),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -123,7 +124,6 @@ function refreshTrayMenu(): void {
 }
 
 function createTray(): void {
-  // 占位图标，正式发布替换 resources/tray/iconTemplate.png
   const iconPath = join(__dirname, '../../resources/tray/iconTemplate.png')
   let icon: Electron.NativeImage
   try {
@@ -132,6 +132,7 @@ function createTray(): void {
   } catch {
     icon = nativeImage.createEmpty()
   }
+  if (process.platform === 'darwin') icon.setTemplateImage(true)
   tray = new Tray(icon)
   tray.setToolTip('StreamDesk Worker')
   refreshTrayMenu()
