@@ -27,6 +27,8 @@ files:
 
 asarUnpack:
   - resources/**
+  - 'node_modules/keytar/**'
+  - '**/*.node'
   - 'node_modules/playwright/**'
   - 'node_modules/playwright-core/**'
 

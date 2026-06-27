@@ -35,6 +35,22 @@ function signNestedCode(appPath) {
   }
 }
 
+function signNativeAddons(dir) {
+  if (!fs.existsSync(dir)) return;
+
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      signNativeAddons(entryPath);
+      continue;
+    }
+
+    if (entry.isFile() && entry.name.endsWith('.node')) {
+      sign(entryPath);
+    }
+  }
+}
+
 module.exports = async function adhocSignMac(context) {
   if (context.electronPlatformName !== 'darwin') return;
 
@@ -46,6 +62,7 @@ module.exports = async function adhocSignMac(context) {
   pruneLocales(path.join(appPath, 'Contents', 'Frameworks', 'Electron Framework.framework', 'Resources'));
 
   signNestedCode(appPath);
+  signNativeAddons(path.join(appPath, 'Contents', 'Resources', 'app.asar.unpacked'));
   sign(appPath, ['--requirements', `=designated => identifier "${bundleId}"`]);
 
   execFileSync('codesign', [
