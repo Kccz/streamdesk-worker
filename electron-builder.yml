@@ -6,6 +6,8 @@ directories:
   buildResources: resources
   output: release/${version}
 
+afterPack: scripts/adhoc-sign-mac.cjs
+
 files:
   - out/**
   - resources/**
@@ -25,6 +27,7 @@ mac:
   target:
     - dmg
     - zip
+  artifactName: StreamDesk-Worker-${version}-${arch}.${ext}
   category: public.app-category.utilities
   # 不签名构建（等买证书后再开启 hardenedRuntime + entitlements）
   identity: null
